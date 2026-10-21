@@ -13,8 +13,10 @@ import {
 import { io } from "socket.io-client";
 import "./App.css";
 
-const API = "http://127.0.0.1:5000/api";
-const SOCKET_URL = "http://127.0.0.1:5000";
+const API =
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:5000/api";
+const SOCKET_URL =
+  import.meta.env.VITE_SOCKET_URL || "http://127.0.0.1:5000";
 const TARGET_SAMPLE_RATE = 16000;
 
 const languageMap = {
@@ -35,10 +37,7 @@ function downsampleToPCM16(input, inputSampleRate) {
 
   for (let i = 0; i < outputLength; i++) {
     const start = Math.floor(i * ratio);
-    const end = Math.min(
-      Math.floor((i + 1) * ratio),
-      input.length
-    );
+    const end = Math.min(Math.floor((i + 1) * ratio), input.length);
 
     let sum = 0;
     let count = 0;
@@ -79,6 +78,8 @@ export default function App() {
   const stoppingRef = useRef(false);
   const savedTextRef = useRef("");
   const recordingRef = useRef(false);
+  const processingRef = useRef(false);
+  const mountedRef = useRef(false);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -91,9 +92,9 @@ export default function App() {
         throw new Error(data.error || "Could not load history.");
       }
 
-      setHistory(data);
+      setHistory(Array.isArray(data) ? data : []);
     } catch (error) {
-      setStatus(error.message || "Cannot connect to Flask.");
+      setStatus(error.message || "Cannot connect to the backend.");
     } finally {
       setLoading(false);
     }
@@ -106,9 +107,11 @@ export default function App() {
   const releaseAudio = useCallback(async () => {
     if (processorRef.current) {
       processorRef.current.onaudioprocess = null;
+
       try {
         processorRef.current.disconnect();
       } catch {}
+
       processorRef.current = null;
     }
 
@@ -116,6 +119,7 @@ export default function App() {
       try {
         sourceRef.current.disconnect();
       } catch {}
+
       sourceRef.current = null;
     }
 
@@ -123,6 +127,7 @@ export default function App() {
       try {
         muteGainRef.current.disconnect();
       } catch {}
+
       muteGainRef.current = null;
     }
 
@@ -146,35 +151,51 @@ export default function App() {
   const finishRecording = useCallback(async () => {
     await releaseAudio();
     recordingRef.current = false;
+    stoppingRef.current = false;
     setRecording(false);
   }, [releaseAudio]);
 
-  function createSocket() {
+  const createSocket = useCallback(() => {
     return new Promise((resolve, reject) => {
       const socket = io(SOCKET_URL, {
-        transports: ["websocket"],
-        timeout: 15000,
+        transports: ["websocket", "polling"],
+        timeout: 20000,
         reconnection: false,
       });
 
       socketRef.current = socket;
 
+      let settled = false;
+
       const timeout = window.setTimeout(() => {
-        socket.disconnect();
-        reject(new Error("Could not connect to the transcription server."));
-      }, 16000);
+        if (!settled) {
+          settled = true;
+          socket.disconnect();
+          socketRef.current = null;
+          reject(
+            new Error("Could not connect to the transcription server.")
+          );
+        }
+      }, 21000);
 
       socket.once("connect", () => {
+        if (settled) return;
+
+        settled = true;
         window.clearTimeout(timeout);
         resolve(socket);
       });
 
       socket.once("connect_error", (error) => {
+        if (settled) return;
+
+        settled = true;
         window.clearTimeout(timeout);
+        socket.disconnect();
+        socketRef.current = null;
+
         reject(
-          new Error(
-            `WebSocket connection failed: ${error.message}`
-          )
+          new Error(`WebSocket connection failed: ${error.message}`)
         );
       });
 
@@ -184,7 +205,6 @@ export default function App() {
 
       socket.on("transcription_update", (data) => {
         if (data.transcript_text) {
-          // This is the current accumulated result, not an append-only delta.
           setTranscript(data.transcript_text);
           savedTextRef.current = data.transcript_text;
 
@@ -202,6 +222,7 @@ export default function App() {
         setTranscript(data.transcript_text || "");
         savedTextRef.current = data.transcript_text || "";
         setEditingId(null);
+        processingRef.current = false;
         setProcessing(false);
 
         setStatus(
@@ -210,12 +231,16 @@ export default function App() {
 
         await loadHistory();
         socket.disconnect();
-        socketRef.current = null;
+
+        if (socketRef.current === socket) {
+          socketRef.current = null;
+        }
       });
 
       socket.on("transcription_error", async (data) => {
         setStatus(data.error || "Transcription failed.");
         await finishRecording();
+        processingRef.current = false;
         setProcessing(false);
       });
 
@@ -225,10 +250,10 @@ export default function App() {
         }
       });
     });
-  }
+  }, [finishRecording, loadHistory]);
 
   async function startRecording() {
-    if (recordingRef.current || processing) return;
+    if (recordingRef.current || processingRef.current) return;
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus("Microphone access requires localhost or HTTPS.");
@@ -270,19 +295,18 @@ export default function App() {
       }
 
       socket = await createSocket();
+
       socket.emit("audio_start", {
         language: languageMap[language] || "auto",
       });
 
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
-      const processor = audioContext.createScriptProcessor(
-        4096,
-        1,
-        1
-      );
+
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
-     const muteGain = audioContext.createGain();
+
+      const muteGain = audioContext.createGain();
       muteGain.gain.value = 0;
       muteGainRef.current = muteGain;
 
@@ -298,10 +322,8 @@ export default function App() {
         }
 
         const input = event.inputBuffer.getChannelData(0);
-        const pcm = downsampleToPCM16(
-          input,
-          audioContext.sampleRate
-        );
+        const pcm = downsampleToPCM16(input, audioContext.sampleRate);
+
         activeSocket.emit("audio_chunk", pcm.buffer);
       };
 
@@ -311,21 +333,30 @@ export default function App() {
 
       recordingRef.current = true;
       stoppingRef.current = false;
+      processingRef.current = false;
+
       setRecording(true);
+      setProcessing(false);
       setTranscript("");
       savedTextRef.current = "";
+      setEditingId(null);
       setStatus("Recording started. Speak naturally.");
     } catch (error) {
       recordingRef.current = false;
+      processingRef.current = false;
+
       setRecording(false);
       setProcessing(false);
+
       await releaseAudio();
 
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-        socketRef.current = null;
+      const activeSocket = socketRef.current || socket;
+
+      if (activeSocket) {
+        activeSocket.disconnect();
       }
 
+      socketRef.current = null;
       setStatus(error.message || "Could not start recording.");
     }
   }
@@ -334,8 +365,11 @@ export default function App() {
     if (!recordingRef.current || stoppingRef.current) return;
 
     stoppingRef.current = true;
+    processingRef.current = true;
+
     setProcessing(true);
     setStatus("Finishing audio and saving the final transcript...");
+
     if (processorRef.current) {
       processorRef.current.onaudioprocess = null;
     }
@@ -348,10 +382,13 @@ export default function App() {
     const socket = socketRef.current;
 
     if (!socket?.connected) {
+      stoppingRef.current = false;
+      processingRef.current = false;
       setProcessing(false);
       setStatus("Connection lost before final transcription.");
       return;
     }
+
     socket.emit("audio_stop");
   }
 
@@ -361,12 +398,15 @@ export default function App() {
       return;
     }
 
+    if (processingRef.current) return;
+
     const isEditing = editingId !== null;
     const url = isEditing
       ? `${API}/transcriptions/${editingId}`
       : `${API}/transcriptions`;
 
     try {
+      processingRef.current = true;
       setProcessing(true);
 
       const response = await fetch(url, {
@@ -393,12 +433,13 @@ export default function App() {
     } catch (error) {
       setStatus(error.message || "Could not save text.");
     } finally {
+      processingRef.current = false;
       setProcessing(false);
     }
   }
 
   function editTranscript(item) {
-    if (recordingRef.current || processing) return;
+    if (recordingRef.current || processingRef.current) return;
 
     setTranscript(item.transcript_text || "");
     savedTextRef.current = item.transcript_text || "";
@@ -421,7 +462,7 @@ export default function App() {
   }
 
   async function deleteTranscript(id) {
-    if (recordingRef.current || processing) return;
+    if (recordingRef.current || processingRef.current) return;
 
     if (
       !window.confirm(
@@ -432,6 +473,9 @@ export default function App() {
     }
 
     try {
+      processingRef.current = true;
+      setProcessing(true);
+
       const response = await fetch(`${API}/transcriptions/${id}`, {
         method: "DELETE",
       });
@@ -450,15 +494,23 @@ export default function App() {
       await loadHistory();
     } catch (error) {
       setStatus(error.message || "Could not delete transcription.");
+    } finally {
+      processingRef.current = false;
+      setProcessing(false);
     }
   }
 
   useEffect(() => {
+    mountedRef.current = true;
+
     return () => {
+      mountedRef.current = false;
       recordingRef.current = false;
+      stoppingRef.current = true;
 
       if (socketRef.current) {
         socketRef.current.disconnect();
+        socketRef.current = null;
       }
 
       if (processorRef.current) {
@@ -547,7 +599,11 @@ export default function App() {
                 Start recording
               </button>
             ) : (
-              <button className="stop" onClick={stopRecording}>
+              <button
+                className="stop"
+                onClick={stopRecording}
+                disabled={processing}
+              >
                 <Square size={16} />
                 Stop and save
               </button>
