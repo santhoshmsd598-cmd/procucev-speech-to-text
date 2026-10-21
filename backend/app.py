@@ -16,28 +16,46 @@ from transcription_service import model, transcribe_audio
 
 load_dotenv()
 
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+DEFAULT_FRONTEND_URL = (
+    "https://procucev-speech-to-text.vercel.app"
+)
 
-frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+frontend_url = os.getenv(
+    "FRONTEND_URL",
+    DEFAULT_FRONTEND_URL,
+).strip().rstrip("/")
 
 allowed_origins = [
     "http://localhost:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
+    DEFAULT_FRONTEND_URL,
 ]
 
-if frontend_url:
+if frontend_url and frontend_url not in allowed_origins:
     allowed_origins.append(frontend_url)
 
-CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": allowed_origins,
+        }
+    },
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 socketio = SocketIO(
     app,
     cors_allowed_origins=allowed_origins,
     async_mode="threading",
 )
+
 
 audio_sessions = {}
 audio_sessions_lock = threading.Lock()
@@ -76,7 +94,23 @@ def serialize_transcription(row):
     for field in ("created_at", "updated_at"):
         if row.get(field) is not None:
             row[field] = row[field].isoformat()
+
     return row
+
+
+def close_db_resources(cursor=None, conn=None):
+    if cursor is not None:
+        try:
+            cursor.close()
+        except Error:
+            app.logger.exception("Could not close database cursor")
+
+    if conn is not None:
+        try:
+            if conn.is_connected():
+                conn.close()
+        except Error:
+            app.logger.exception("Could not close database connection")
 
 
 @app.errorhandler(413)
@@ -86,32 +120,35 @@ def file_too_large(_error):
     }), 413
 
 
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "message": "Procucev Speech-to-Text API is running!"
-    })
-
+    }), 200
 
 @app.route("/api/health", methods=["GET"])
 def health():
     conn = None
+
     try:
         conn = get_db_connection()
+
         return jsonify({
             "status": "healthy",
             "database": "connected",
         }), 200
+
     except Error:
         app.logger.exception("Database health check failed")
+
         return jsonify({
             "status": "error",
             "database": "disconnected",
         }), 503
-    finally:
-        if conn is not None and conn.is_connected():
-            conn.close()
 
+    finally:
+        close_db_resources(conn=conn)
 
 @app.route("/api/transcriptions", methods=["GET"])
 def list_transcriptions():
@@ -121,30 +158,34 @@ def list_transcriptions():
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
+
         cursor.execute("""
             SELECT id, transcript_text, language, created_at, updated_at
             FROM transcriptions
             ORDER BY created_at DESC
         """)
+
         rows = cursor.fetchall()
+
         return jsonify([
-            serialize_transcription(row) for row in rows
-        ])
+            serialize_transcription(row)
+            for row in rows
+        ]), 200
+
     except Error:
         app.logger.exception("Could not list transcriptions")
+
         return jsonify({
             "error": "Database operation failed"
         }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
 
+    finally:
+        close_db_resources(cursor, conn)
 
 @app.route("/api/transcriptions", methods=["POST"])
 def create_transcription():
     data = request.get_json(silent=True) or {}
+
     transcript = data.get("transcript_text", "")
     language = data.get("language", "auto")
 
@@ -164,10 +205,12 @@ def create_transcription():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+
         cursor.execute("""
             INSERT INTO transcriptions (transcript_text, language)
             VALUES (%s, %s)
         """, (transcript.strip(), language))
+
         conn.commit()
         new_id = cursor.lastrowid
 
@@ -177,19 +220,21 @@ def create_transcription():
             "language": language,
             "message": "Transcription saved",
         }), 201
+
     except Error:
         app.logger.exception("Could not save transcription")
+
         return jsonify({
             "error": "Database operation failed"
         }), 500
+
     finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
+        close_db_resources(cursor, conn)
 
-
-@app.route("/api/transcriptions/<int:transcription_id>", methods=["GET"])
+@app.route(
+    "/api/transcriptions/<int:transcription_id>",
+    methods=["GET"],
+)
 def get_transcription(transcription_id):
     conn = None
     cursor = None
@@ -197,11 +242,13 @@ def get_transcription(transcription_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
+
         cursor.execute("""
             SELECT id, transcript_text, language, created_at, updated_at
             FROM transcriptions
             WHERE id = %s
         """, (transcription_id,))
+
         row = cursor.fetchone()
 
         if not row:
@@ -209,22 +256,25 @@ def get_transcription(transcription_id):
                 "error": "Transcription not found"
             }), 404
 
-        return jsonify(serialize_transcription(row))
+        return jsonify(serialize_transcription(row)), 200
+
     except Error:
         app.logger.exception("Could not retrieve transcription")
+
         return jsonify({
             "error": "Database operation failed"
         }), 500
+
     finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
+        close_db_resources(cursor, conn)
 
-
-@app.route("/api/transcriptions/<int:transcription_id>", methods=["PUT"])
+@app.route(
+    "/api/transcriptions/<int:transcription_id>",
+    methods=["PUT"],
+)
 def update_transcription(transcription_id):
     data = request.get_json(silent=True) or {}
+
     transcript = data.get("transcript_text")
     language = data.get("language")
 
@@ -256,7 +306,11 @@ def update_transcription(transcription_id):
                 UPDATE transcriptions
                 SET transcript_text = %s, language = %s
                 WHERE id = %s
-            """, (transcript.strip(), language, transcription_id))
+            """, (
+                transcript.strip(),
+                language,
+                transcription_id,
+            ))
 
         conn.commit()
 
@@ -265,6 +319,7 @@ def update_transcription(transcription_id):
                 "SELECT id FROM transcriptions WHERE id = %s",
                 (transcription_id,),
             )
+
             if not cursor.fetchone():
                 return jsonify({
                     "error": "Transcription not found"
@@ -272,20 +327,22 @@ def update_transcription(transcription_id):
 
         return jsonify({
             "message": "Transcription updated"
-        })
+        }), 200
+
     except Error:
         app.logger.exception("Could not update transcription")
+
         return jsonify({
             "error": "Database operation failed"
         }), 500
+
     finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
+        close_db_resources(cursor, conn)
 
-
-@app.route("/api/transcriptions/<int:transcription_id>", methods=["DELETE"])
+@app.route(
+    "/api/transcriptions/<int:transcription_id>",
+    methods=["DELETE"],
+)
 def delete_transcription(transcription_id):
     conn = None
     cursor = None
@@ -293,10 +350,12 @@ def delete_transcription(transcription_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+
         cursor.execute(
             "DELETE FROM transcriptions WHERE id = %s",
             (transcription_id,),
         )
+
         conn.commit()
 
         if cursor.rowcount == 0:
@@ -306,18 +365,17 @@ def delete_transcription(transcription_id):
 
         return jsonify({
             "message": "Transcription deleted"
-        })
+        }), 200
+
     except Error:
         app.logger.exception("Could not delete transcription")
+
         return jsonify({
             "error": "Database operation failed"
         }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
 
+    finally:
+        close_db_resources(cursor, conn)
 
 @app.route("/api/transcribe-audio", methods=["POST"])
 def transcribe_audio_api():
@@ -346,9 +404,15 @@ def transcribe_audio_api():
         }), 400
 
     suffix = os.path.splitext(audio.filename)[1].lower()
+
     allowed_extensions = {
-        ".wav", ".mp3", ".m4a", ".webm",
-        ".ogg", ".flac", ".mp4",
+        ".wav",
+        ".mp3",
+        ".m4a",
+        ".webm",
+        ".ogg",
+        ".flac",
+        ".mp4",
     }
 
     if suffix not in allowed_extensions:
@@ -372,6 +436,7 @@ def transcribe_audio_api():
             temp_path,
             language=supported_languages[language],
         )
+
         transcript = result["transcript_text"]
 
         if not transcript:
@@ -381,41 +446,49 @@ def transcribe_audio_api():
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
         cursor.execute("""
             INSERT INTO transcriptions (transcript_text, language)
             VALUES (%s, %s)
         """, (transcript, result["language"]))
+
         conn.commit()
+        record_id = cursor.lastrowid
 
         return jsonify({
             "message": "Audio transcribed and saved successfully",
-            "id": cursor.lastrowid,
+            "id": record_id,
             "transcript_text": transcript,
             "language": result["language"],
             "language_probability": result["language_probability"],
         }), 201
+
     except Error:
-        app.logger.exception("Database error during audio transcription")
+        app.logger.exception(
+            "Database error during audio transcription"
+        )
+
         return jsonify({
             "error": "Could not save transcription to the database"
         }), 500
+
     except Exception:
         app.logger.exception("Audio transcription failed")
+
         return jsonify({
             "error": "Audio transcription failed. Check backend logs."
         }), 500
+
     finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
+        close_db_resources(cursor, conn)
 
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
             except OSError:
-                app.logger.warning("Could not remove temporary audio file")
-
+                app.logger.warning(
+                    "Could not remove temporary audio file"
+                )
 
 def pcm_to_wav(pcm_bytes, sample_rate=16000):
     output = io.BytesIO()
@@ -428,9 +501,9 @@ def pcm_to_wav(pcm_bytes, sample_rate=16000):
 
     return output.getvalue()
 
-
 def transcribe_pcm(pcm_bytes, language):
     wav_bytes = pcm_to_wav(pcm_bytes)
+
     segments, info = model.transcribe(
         io.BytesIO(wav_bytes),
         language=None if language == "auto" else language,
@@ -439,11 +512,11 @@ def transcribe_pcm(pcm_bytes, language):
     )
 
     text = " ".join(
-        segment.text.strip() for segment in segments
+        segment.text.strip()
+        for segment in segments
     ).strip()
 
     return text, info
-
 
 @socketio.on("audio_start")
 def handle_audio_start(data=None):
@@ -469,8 +542,6 @@ def handle_audio_start(data=None):
         "message": "Audio stream ready",
         "sample_rate": 16000,
     })
-
-
 @socketio.on("audio_chunk")
 def handle_audio_chunk(audio_bytes):
     if not isinstance(audio_bytes, bytes):
@@ -490,22 +561,28 @@ def handle_audio_chunk(audio_bytes):
 
     with session["lock"]:
         session["pcm"].extend(audio_bytes)
+
         total_bytes = len(session["pcm"])
         bytes_per_three_seconds = 16000 * 2 * 3
 
         if session["processing"]:
             return
 
-        if total_bytes - session["last_processed_bytes"] < bytes_per_three_seconds:
+        if (
+            total_bytes - session["last_processed_bytes"]
+            < bytes_per_three_seconds
+        ):
             return
 
         session["processing"] = True
         session["last_processed_bytes"] = total_bytes
+
         audio_snapshot = bytes(session["pcm"])
         language = session["language"]
 
     try:
         text, info = transcribe_pcm(audio_snapshot, language)
+
         emit("transcription_update", {
             "transcript_text": text,
             "language": info.language,
@@ -513,15 +590,17 @@ def handle_audio_chunk(audio_bytes):
                 info.language_probability, 4
             ),
         })
+
     except Exception:
         app.logger.exception("Streaming transcription failed")
+
         emit("transcription_error", {
             "error": "Could not transcribe this audio segment"
         })
+
     finally:
         with session["lock"]:
             session["processing"] = False
-
 
 @socketio.on("audio_stop")
 def handle_audio_stop():
@@ -549,6 +628,7 @@ def handle_audio_stop():
             return
 
         wav_bytes = pcm_to_wav(pcm_bytes)
+
         segments, info = model.transcribe(
             io.BytesIO(wav_bytes),
             language=None if language == "auto" else language,
@@ -557,7 +637,8 @@ def handle_audio_stop():
         )
 
         final_text = " ".join(
-            segment.text.strip() for segment in segments
+            segment.text.strip()
+            for segment in segments
         ).strip()
 
         if not final_text:
@@ -568,10 +649,12 @@ def handle_audio_stop():
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
         cursor.execute("""
             INSERT INTO transcriptions (transcript_text, language)
             VALUES (%s, %s)
         """, (final_text, info.language))
+
         conn.commit()
         record_id = cursor.lastrowid
 
@@ -584,19 +667,22 @@ def handle_audio_stop():
             ),
             "message": "Transcription saved successfully",
         })
+
     except Exception:
-        app.logger.exception("Final streaming transcription failed")
+        app.logger.exception(
+            "Final streaming transcription failed"
+        )
+
         emit("transcription_error", {
             "error": "Final transcription or database save failed"
         })
+
     finally:
-        if cursor:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
+        close_db_resources(cursor, conn)
 
         with audio_sessions_lock:
             audio_sessions.pop(request.sid, None)
+
 
 
 @socketio.on("disconnect")
@@ -604,11 +690,10 @@ def handle_disconnect():
     with audio_sessions_lock:
         audio_sessions.pop(request.sid, None)
 
-
 if __name__ == "__main__":
     socketio.run(
         app,
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=int(os.getenv("PORT", "5000")),
         debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
         use_reloader=False,
