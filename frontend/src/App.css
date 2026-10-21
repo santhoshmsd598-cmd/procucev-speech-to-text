@@ -1,0 +1,148 @@
+
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+:root {
+  font-family: "DM Sans", sans-serif;
+  color: #f1f3fa;
+  background: #0c0d12;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: radial-gradient(ellipse at top, #191b2c 0%, #0c0d12 55%);
+}
+
+button, textarea, select { font: inherit; }
+button { cursor: pointer; }
+
+.app {
+  max-width: 1120px;
+  margin: auto;
+  padding: 28px 24px;
+}
+
+header, .panel-title, .controls, .history-meta, .history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.brand {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 25px;
+  font-weight: 700;
+}
+
+.brand span, .hero h1 span { color: #a99aff; }
+
+.badge, .live {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #bcb0ff;
+  background: #211d39;
+  border: 1px solid #3b3260;
+  padding: 8px 12px;
+  border-radius: 20px;
+}
+
+.hero { text-align: center; padding: 62px 0 38px; }
+.eyebrow { color: #a99aff; font-size: 11px; letter-spacing: 2px; }
+.hero h1 {
+  font: 700 clamp(36px, 6vw, 60px) "Space Grotesk", sans-serif;
+  margin: 14px 0;
+}
+.subtitle { max-width: 580px; margin: auto; color: #a4a6b8; line-height: 1.7; }
+
+.workspace {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+.panel {
+  background: #14151e;
+  border: 1px solid #292b3a;
+  border-radius: 18px;
+  padding: 24px;
+  min-width: 0;
+}
+
+.panel h2 { font: 600 19px "Space Grotesk", sans-serif; margin: 0 0 7px; }
+.panel-title p, .hint { color: #9396aa; font-size: 12px; line-height: 1.6; margin: 0 0 18px; }
+.live { color: #9ba0b4; background: #20212b; border-color: #333547; }
+.live.active { color: #8ff0bc; background: #153127; border-color: #245640; }
+
+label { display: block; font-size: 12px; color: #c6c8d5; margin: 18px 0 8px; }
+select, textarea {
+  width: 100%;
+  color: #f1f3fa;
+  background: #0e0f16;
+  border: 1px solid #303244;
+  border-radius: 10px;
+  padding: 12px;
+  outline: none;
+}
+select:focus, textarea:focus { border-color: #9381ff; }
+textarea { resize: vertical; margin: 14px 0; line-height: 1.7; }
+textarea::placeholder { color: #666a7e; }
+
+.controls { justify-content: flex-start; flex-wrap: wrap; }
+.controls button, .small, .icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  padding: 11px 14px;
+  font-weight: 600;
+  font-size: 12px;
+}
+.primary { color: white; background: #7864ee; }
+.primary:hover { background: #8c7bff; }
+.stop { color: white; background: #b84657; }
+.secondary, .icon-button, .small {
+  color: #d5d5e4;
+  background: #20212c;
+  border-color: #363849;
+}
+.status { color: #b8b1ff; font-size: 12px; min-height: 18px; margin: 16px 0 6px; }
+.hint { margin: 0; }
+.history-count { color: #a99aff; font-size: 12px; margin: 20px 0 12px; }
+
+.empty {
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  color: #777b91;
+  text-align: center;
+  gap: 10px;
+}
+.empty p { margin: 0; color: #e4e5ef; }
+.empty span { font-size: 12px; }
+
+.history-list { display: grid; gap: 12px; }
+.history-item { border: 1px solid #303142; background: #101119; border-radius: 12px; padding: 14px; }
+.history-meta { color: #a3a5b7; font-size: 10px; letter-spacing: .6px; }
+.history-item > p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; font-size: 13px; }
+.history-actions { justify-content: flex-start; }
+.small { padding: 7px 10px; font-size: 11px; }
+.delete { background: #321b24; color: #ff9aa8; border-color: #54303b; }
+footer { text-align: center; color: #6f7286; font-size: 11px; padding: 28px 0 8px; }
+
+@media (max-width: 760px) {
+  .app { padding: 20px 14px; }
+  .hero { padding: 42px 0 28px; }
+  .workspace { grid-template-columns: 1fr; }
+  .panel { padding: 18px; }
+  header { align-items: flex-start; }
+}
