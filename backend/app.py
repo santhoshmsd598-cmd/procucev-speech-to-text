@@ -539,6 +539,9 @@ def transcribe_pcm(pcm_bytes, language, beam_size=1):
             language=None if language == "auto" else language,
             beam_size=beam_size,
             vad_filter=USE_VAD,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            without_timestamps=True,
         )
 
         print(
@@ -560,6 +563,41 @@ def transcribe_pcm(pcm_bytes, language, beam_size=1):
         text = " ".join(parts).strip()
 
     return text, info
+
+
+def run_benchmark():
+    """Time the model on 5 s of synthetic audio and print the result."""
+    try:
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        audio = (rng.standard_normal(16000 * 5) * 0.01).astype(np.float32)
+
+        print("[benchmark] started (5 s of synthetic audio)", flush=True)
+        started = time.time()
+
+        with model_lock:
+            segments, _info = model.transcribe(
+                audio,
+                language="en",
+                beam_size=1,
+                vad_filter=False,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+            )
+            list(segments)
+
+        print(
+            f"[benchmark] 5 s of audio took {time.time() - started:.1f}s",
+            flush=True,
+        )
+    except Exception:
+        app.logger.exception("Benchmark failed")
+
+
+if os.getenv("WHISPER_BENCHMARK", "false").lower() == "true":
+    threading.Thread(target=run_benchmark, daemon=True).start()
 
 
 @socketio.on("audio_start")
