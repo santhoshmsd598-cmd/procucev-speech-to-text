@@ -245,7 +245,12 @@ export default function App() {
       });
 
       socket.on("disconnect", () => {
-        if (recordingRef.current && !stoppingRef.current) {
+        if (stoppingRef.current || processingRef.current) {
+          processingRef.current = false;
+          stoppingRef.current = false;
+          setProcessing(false);
+          setStatus("Server connection lost while saving. Please try again.");
+        } else if (recordingRef.current) {
           setStatus("WebSocket disconnected. Please try again.");
         }
       });
@@ -390,6 +395,17 @@ export default function App() {
     }
 
     socket.emit("audio_stop");
+
+    window.setTimeout(() => {
+      if (processingRef.current && stoppingRef.current) {
+        processingRef.current = false;
+        stoppingRef.current = false;
+        setProcessing(false);
+        setStatus(
+          "Timed out waiting for the transcript. Try a shorter recording."
+        );
+      }
+    }, 90000);
   }
 
   async function saveTranscript() {
