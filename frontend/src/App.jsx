@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Mic,
@@ -18,12 +17,14 @@ const API =
 const SOCKET_URL =
   import.meta.env.VITE_SOCKET_URL || "http://127.0.0.1:5000";
 const TARGET_SAMPLE_RATE = 16000;
+const STOP_TIMEOUT_MS = 300000;
 
 const languageMap = {
   "en-IN": "en",
   "en-US": "en",
   "hi-IN": "hi",
   "ta-IN": "ta",
+  auto: "auto",
 };
 
 function downsampleToPCM16(input, inputSampleRate) {
@@ -65,7 +66,7 @@ export default function App() {
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [status, setStatus] = useState("Ready");
-  const [language, setLanguage] = useState("en-IN");
+  const [language, setLanguage] = useState("auto");
   const [editingId, setEditingId] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -80,6 +81,14 @@ export default function App() {
   const recordingRef = useRef(false);
   const processingRef = useRef(false);
   const mountedRef = useRef(false);
+  const stopTimeoutRef = useRef(null);
+
+  const clearStopTimeout = useCallback(() => {
+    if (stopTimeoutRef.current) {
+      window.clearTimeout(stopTimeoutRef.current);
+      stopTimeoutRef.current = null;
+    }
+  }, []);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -217,6 +226,7 @@ export default function App() {
       });
 
       socket.on("transcription_complete", async (data) => {
+        clearStopTimeout();
         await finishRecording();
 
         setTranscript(data.transcript_text || "");
@@ -238,6 +248,7 @@ export default function App() {
       });
 
       socket.on("transcription_error", async (data) => {
+        clearStopTimeout();
         setStatus(data.error || "Transcription failed.");
         await finishRecording();
         processingRef.current = false;
@@ -245,17 +256,21 @@ export default function App() {
       });
 
       socket.on("disconnect", () => {
+        // Connection dropped while waiting for the final transcript.
         if (stoppingRef.current || processingRef.current) {
+          clearStopTimeout();
           processingRef.current = false;
           stoppingRef.current = false;
           setProcessing(false);
-          setStatus("Server connection lost while saving. Please try again.");
+          setStatus(
+            "Server connection lost while saving. Please try again."
+          );
         } else if (recordingRef.current) {
           setStatus("WebSocket disconnected. Please try again.");
         }
       });
     });
-  }, [finishRecording, loadHistory]);
+  }, [finishRecording, loadHistory, clearStopTimeout]);
 
   async function startRecording() {
     if (recordingRef.current || processingRef.current) return;
@@ -299,6 +314,7 @@ export default function App() {
         );
       }
 
+      setStatus("Connecting to the transcription server...");
       socket = await createSocket();
 
       socket.emit("audio_start", {
@@ -396,7 +412,11 @@ export default function App() {
 
     socket.emit("audio_stop");
 
-    window.setTimeout(() => {
+    // Safety net: never leave the UI stuck on "Finishing audio...".
+    clearStopTimeout();
+    stopTimeoutRef.current = window.setTimeout(() => {
+      stopTimeoutRef.current = null;
+
       if (processingRef.current && stoppingRef.current) {
         processingRef.current = false;
         stoppingRef.current = false;
@@ -404,8 +424,13 @@ export default function App() {
         setStatus(
           "Timed out waiting for the transcript. Try a shorter recording."
         );
+
+        if (socketRef.current) {
+          socketRef.current.disconnect();
+          socketRef.current = null;
+        }
       }
-    }, 90000);
+    }, STOP_TIMEOUT_MS);
   }
 
   async function saveTranscript() {
@@ -524,6 +549,11 @@ export default function App() {
       recordingRef.current = false;
       stoppingRef.current = true;
 
+      if (stopTimeoutRef.current) {
+        window.clearTimeout(stopTimeoutRef.current);
+        stopTimeoutRef.current = null;
+      }
+
       if (socketRef.current) {
         socketRef.current.disconnect();
         socketRef.current = null;
@@ -594,6 +624,7 @@ export default function App() {
             <option value="hi-IN">Hindi</option>
             <option value="ta-IN">Tamil</option>
             <option value="en-US">English (US)</option>
+            <option value="auto">Auto-detect (Hindi + English mix)</option>
           </select>
 
           <textarea

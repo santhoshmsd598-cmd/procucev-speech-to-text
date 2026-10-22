@@ -1,18 +1,18 @@
 import os
 import io
+import mimetypes
 import wave
 import tempfile
 import threading
 import time
 
 import mysql.connector
+import requests
 from mysql.connector import Error
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-
-from transcription_service import model, transcribe_audio
 
 load_dotenv()
 
@@ -75,6 +75,136 @@ LIVE_INTERIM = os.getenv("LIVE_INTERIM", "true").lower() == "true"
 # Voice-activity detection (onnxruntime) adds CPU cost and a possible
 # failure point. Set WHISPER_VAD=false to skip it.
 USE_VAD = os.getenv("WHISPER_VAD", "true").lower() == "true"
+
+# --- Transcription provider -------------------------------------------
+# "groq"  -> hosted Whisper API (fast; needs GROQ_API_KEY)
+# "local" -> Faster-Whisper inside this server (needs a strong CPU)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+TRANSCRIBE_PROVIDER = os.getenv(
+    "TRANSCRIBE_PROVIDER",
+    "groq" if GROQ_API_KEY else "local",
+).strip().lower()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo").strip()
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_PROMPT = os.getenv("GROQ_PROMPT", "").strip()
+
+# Seconds of new audio between live (interim) updates.
+INTERIM_SECONDS = float(os.getenv("INTERIM_SECONDS", "5"))
+# Live updates only send the most recent N seconds of audio.
+INTERIM_MAX_AUDIO_SECONDS = 60
+
+LANGUAGE_NAME_TO_CODE = {
+    "english": "en",
+    "hindi": "hi",
+    "tamil": "ta",
+}
+
+_local_module = None
+_local_module_lock = threading.Lock()
+
+
+def get_local_module():
+    """Import the Faster-Whisper module only when it is really needed."""
+    global _local_module
+
+    with _local_module_lock:
+        if _local_module is None:
+            import transcription_service
+            _local_module = transcription_service
+
+    return _local_module
+
+
+def normalize_language(value, fallback="auto"):
+    if not value:
+        return fallback
+
+    value = str(value).strip().lower()
+
+    # Keep the result short enough for the database column.
+    return LANGUAGE_NAME_TO_CODE.get(value, value)[:10]
+
+
+def call_groq(file_name, audio_bytes, content_type, language):
+    """Send audio to Groq's Whisper API. Returns (text, language_code)."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
+
+    form = {
+        "model": GROQ_MODEL,
+        "response_format": "verbose_json",
+        "temperature": "0",
+    }
+
+    if language and language != "auto":
+        form["language"] = language
+
+    if GROQ_PROMPT:
+        form["prompt"] = GROQ_PROMPT
+
+    started = time.time()
+
+    response = requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        files={"file": (file_name, audio_bytes, content_type)},
+        data=form,
+        timeout=60,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Groq API returned {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    body = response.json()
+    text = (body.get("text") or "").strip()
+    detected = normalize_language(
+        body.get("language"),
+        fallback=language or "auto",
+    )
+
+    print(
+        f"[groq] {len(audio_bytes)} bytes -> {len(text)} chars "
+        f"in {time.time() - started:.1f}s (language={detected})",
+        flush=True,
+    )
+
+    return text, detected
+
+
+def transcribe_file(path, language):
+    """Transcribe an uploaded audio file with the configured provider."""
+    if TRANSCRIBE_PROVIDER == "groq":
+        with open(path, "rb") as audio_file:
+            audio_bytes = audio_file.read()
+
+        text, detected = call_groq(
+            os.path.basename(path),
+            audio_bytes,
+            mimetypes.guess_type(path)[0] or "application/octet-stream",
+            language,
+        )
+
+        return {
+            "transcript_text": text,
+            "language": detected,
+            "language_probability": None,
+        }
+
+    local = get_local_module()
+
+    with model_lock:
+        return local.transcribe_audio(path, language=language)
+
+
+print(
+    f"[config] transcription provider={TRANSCRIBE_PROVIDER} "
+    f"model={GROQ_MODEL if TRANSCRIBE_PROVIDER == 'groq' else 'local'} "
+    f"live_interim={LIVE_INTERIM}",
+    flush=True,
+)
 
 
 def get_db_connection():
@@ -454,11 +584,10 @@ def transcribe_audio_api():
             temp_path = temp_file.name
             audio.save(temp_path)
 
-        with model_lock:
-            result = transcribe_audio(
-                temp_path,
-                language=supported_languages[language],
-            )
+        result = transcribe_file(
+            temp_path,
+            supported_languages[language],
+        )
 
         transcript = result["transcript_text"]
 
@@ -527,6 +656,22 @@ def pcm_to_wav(pcm_bytes, sample_rate=16000):
 
 
 def transcribe_pcm(pcm_bytes, language, beam_size=1):
+    """Return (text, detected_language, language_probability)."""
+    if TRANSCRIBE_PROVIDER == "groq":
+        text, detected = call_groq(
+            "audio.wav",
+            pcm_to_wav(pcm_bytes),
+            "audio/wav",
+            language,
+        )
+
+        return text, detected, None
+
+    return transcribe_pcm_local(pcm_bytes, language, beam_size)
+
+
+def transcribe_pcm_local(pcm_bytes, language, beam_size=1):
+    model = get_local_module().model
     wav_bytes = pcm_to_wav(pcm_bytes)
 
     # The generator returned by model.transcribe() must be consumed
@@ -562,42 +707,11 @@ def transcribe_pcm(pcm_bytes, language, beam_size=1):
 
         text = " ".join(parts).strip()
 
-    return text, info
-
-
-def run_benchmark():
-    """Time the model on 5 s of synthetic audio and print the result."""
-    try:
-        import numpy as np
-
-        rng = np.random.default_rng(0)
-        audio = (rng.standard_normal(16000 * 5) * 0.01).astype(np.float32)
-
-        print("[benchmark] started (5 s of synthetic audio)", flush=True)
-        started = time.time()
-
-        with model_lock:
-            segments, _info = model.transcribe(
-                audio,
-                language="en",
-                beam_size=1,
-                vad_filter=False,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                without_timestamps=True,
-            )
-            list(segments)
-
-        print(
-            f"[benchmark] 5 s of audio took {time.time() - started:.1f}s",
-            flush=True,
-        )
-    except Exception:
-        app.logger.exception("Benchmark failed")
-
-
-if os.getenv("WHISPER_BENCHMARK", "false").lower() == "true":
-    threading.Thread(target=run_benchmark, daemon=True).start()
+    return (
+        text,
+        info.language,
+        round(info.language_probability, 4),
+    )
 
 
 @socketio.on("audio_start")
@@ -652,44 +766,41 @@ def handle_audio_chunk(audio_bytes):
             return
 
         total_bytes = len(session["pcm"])
-        bytes_per_three_seconds = 16000 * 2 * 3
+        bytes_per_interim = int(16000 * 2 * INTERIM_SECONDS)
 
         if session["processing"]:
             return
 
         if (
             total_bytes - session["last_processed_bytes"]
-            < bytes_per_three_seconds
+            < bytes_per_interim
         ):
             return
 
         session["processing"] = True
         session["last_processed_bytes"] = total_bytes
 
-        audio_snapshot = bytes(session["pcm"])
+        window_bytes = int(16000 * 2 * INTERIM_MAX_AUDIO_SECONDS)
+        audio_snapshot = bytes(session["pcm"][-window_bytes:])
         language = session["language"]
 
     try:
-        text, info = transcribe_pcm(
+        text, detected, probability = transcribe_pcm(
             audio_snapshot,
             language,
             beam_size=1,
         )
 
-        emit("transcription_update", {
-            "transcript_text": text,
-            "language": info.language,
-            "language_probability": round(
-                info.language_probability, 4
-            ),
-        })
+        if text:
+            emit("transcription_update", {
+                "transcript_text": text,
+                "language": detected,
+                "language_probability": probability,
+            })
 
     except Exception:
-        app.logger.exception("Streaming transcription failed")
-
-        emit("transcription_error", {
-            "error": "Could not transcribe this audio segment"
-        })
+        # A failed live update must not stop the recording.
+        app.logger.exception("Live transcription update failed")
 
     finally:
         with session["lock"]:
@@ -732,7 +843,7 @@ def handle_audio_stop():
         started = time.time()
         print("[audio_stop] final transcription started", flush=True)
 
-        final_text, info = transcribe_pcm(
+        final_text, detected_language, probability = transcribe_pcm(
             pcm_bytes,
             language,
             beam_size=1,
@@ -756,7 +867,7 @@ def handle_audio_stop():
         cursor.execute("""
             INSERT INTO transcriptions (transcript_text, language)
             VALUES (%s, %s)
-        """, (final_text, info.language))
+        """, (final_text, detected_language))
 
         conn.commit()
         record_id = cursor.lastrowid
@@ -764,10 +875,8 @@ def handle_audio_stop():
         emit("transcription_complete", {
             "id": record_id,
             "transcript_text": final_text,
-            "language": info.language,
-            "language_probability": round(
-                info.language_probability, 4
-            ),
+            "language": detected_language,
+            "language_probability": probability,
             "message": "Transcription saved successfully",
         })
 
