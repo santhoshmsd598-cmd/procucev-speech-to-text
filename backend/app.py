@@ -67,6 +67,11 @@ audio_sessions_lock = threading.Lock()
 # This prevents memory spikes that crash the worker on small instances.
 model_lock = threading.Lock()
 
+# Live (interim) transcription re-processes all audio so far every ~3 s.
+# On a tiny CPU (e.g. Render free tier) this starves the final transcription.
+# Set LIVE_INTERIM=false to transcribe only once, when recording stops.
+LIVE_INTERIM = os.getenv("LIVE_INTERIM", "true").lower() == "true"
+
 
 def get_db_connection():
     db_host = os.getenv("DB_HOST", "127.0.0.1")
@@ -585,6 +590,9 @@ def handle_audio_chunk(audio_bytes):
 
     with session["lock"]:
         session["pcm"].extend(audio_bytes)
+
+        if not LIVE_INTERIM:
+            return
 
         total_bytes = len(session["pcm"])
         bytes_per_three_seconds = 16000 * 2 * 3
