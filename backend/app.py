@@ -3,6 +3,7 @@ import io
 import wave
 import tempfile
 import threading
+import time
 
 import mysql.connector
 from mysql.connector import Error
@@ -557,6 +558,8 @@ def handle_audio_start(data=None):
             "lock": threading.Lock(),
         }
 
+    print(f"[audio_start] sid={request.sid} language={language}", flush=True)
+
     emit("stream_ready", {
         "message": "Audio stream ready",
         "sample_rate": 16000,
@@ -647,6 +650,13 @@ def handle_audio_stop():
             pcm_bytes = bytes(session["pcm"])
             language = session["language"]
 
+        print(
+            f"[audio_stop] sid={request.sid} "
+            f"bytes={len(pcm_bytes)} "
+            f"seconds={len(pcm_bytes) / 32000:.1f}",
+            flush=True,
+        )
+
         # Require at least ~0.3 seconds of 16 kHz, 16-bit mono audio.
         if len(pcm_bytes) < int(16000 * 2 * 0.3):
             emit("transcription_error", {
@@ -654,10 +664,19 @@ def handle_audio_stop():
             })
             return
 
+        started = time.time()
+        print("[audio_stop] final transcription started", flush=True)
+
         final_text, info = transcribe_pcm(
             pcm_bytes,
             language,
             beam_size=1,
+        )
+
+        print(
+            f"[audio_stop] final transcription done in "
+            f"{time.time() - started:.1f}s, chars={len(final_text)}",
+            flush=True,
         )
 
         if not final_text:
