@@ -1,4 +1,3 @@
-
 import os
 import io
 import wave
@@ -54,11 +53,18 @@ socketio = SocketIO(
     app,
     cors_allowed_origins=allowed_origins,
     async_mode="threading",
+    ping_timeout=120,
+    ping_interval=25,
+    max_http_buffer_size=5 * 1024 * 1024,
 )
 
 
 audio_sessions = {}
 audio_sessions_lock = threading.Lock()
+
+# Only one transcription may run on the model at a time.
+# This prevents memory spikes that crash the worker on small instances.
+model_lock = threading.Lock()
 
 
 def get_db_connection():
@@ -120,12 +126,12 @@ def file_too_large(_error):
     }), 413
 
 
-
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "message": "Procucev Speech-to-Text API is running!"
     }), 200
+
 
 @app.route("/api/health", methods=["GET"])
 def health():
@@ -149,6 +155,7 @@ def health():
 
     finally:
         close_db_resources(conn=conn)
+
 
 @app.route("/api/transcriptions", methods=["GET"])
 def list_transcriptions():
@@ -181,6 +188,7 @@ def list_transcriptions():
 
     finally:
         close_db_resources(cursor, conn)
+
 
 @app.route("/api/transcriptions", methods=["POST"])
 def create_transcription():
@@ -231,6 +239,7 @@ def create_transcription():
     finally:
         close_db_resources(cursor, conn)
 
+
 @app.route(
     "/api/transcriptions/<int:transcription_id>",
     methods=["GET"],
@@ -267,6 +276,7 @@ def get_transcription(transcription_id):
 
     finally:
         close_db_resources(cursor, conn)
+
 
 @app.route(
     "/api/transcriptions/<int:transcription_id>",
@@ -339,6 +349,7 @@ def update_transcription(transcription_id):
     finally:
         close_db_resources(cursor, conn)
 
+
 @app.route(
     "/api/transcriptions/<int:transcription_id>",
     methods=["DELETE"],
@@ -376,6 +387,7 @@ def delete_transcription(transcription_id):
 
     finally:
         close_db_resources(cursor, conn)
+
 
 @app.route("/api/transcribe-audio", methods=["POST"])
 def transcribe_audio_api():
@@ -432,10 +444,11 @@ def transcribe_audio_api():
             temp_path = temp_file.name
             audio.save(temp_path)
 
-        result = transcribe_audio(
-            temp_path,
-            language=supported_languages[language],
-        )
+        with model_lock:
+            result = transcribe_audio(
+                temp_path,
+                language=supported_languages[language],
+            )
 
         transcript = result["transcript_text"]
 
@@ -490,6 +503,7 @@ def transcribe_audio_api():
                     "Could not remove temporary audio file"
                 )
 
+
 def pcm_to_wav(pcm_bytes, sample_rate=16000):
     output = io.BytesIO()
 
@@ -501,22 +515,27 @@ def pcm_to_wav(pcm_bytes, sample_rate=16000):
 
     return output.getvalue()
 
-def transcribe_pcm(pcm_bytes, language):
+
+def transcribe_pcm(pcm_bytes, language, beam_size=1):
     wav_bytes = pcm_to_wav(pcm_bytes)
 
-    segments, info = model.transcribe(
-        io.BytesIO(wav_bytes),
-        language=None if language == "auto" else language,
-        beam_size=1,
-        vad_filter=True,
-    )
+    # The generator returned by model.transcribe() must be consumed
+    # while the lock is held, otherwise the work happens outside it.
+    with model_lock:
+        segments, info = model.transcribe(
+            io.BytesIO(wav_bytes),
+            language=None if language == "auto" else language,
+            beam_size=beam_size,
+            vad_filter=True,
+        )
 
-    text = " ".join(
-        segment.text.strip()
-        for segment in segments
-    ).strip()
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
 
     return text, info
+
 
 @socketio.on("audio_start")
 def handle_audio_start(data=None):
@@ -542,9 +561,11 @@ def handle_audio_start(data=None):
         "message": "Audio stream ready",
         "sample_rate": 16000,
     })
+
+
 @socketio.on("audio_chunk")
 def handle_audio_chunk(audio_bytes):
-    if not isinstance(audio_bytes, bytes):
+    if not isinstance(audio_bytes, (bytes, bytearray)):
         emit("transcription_error", {
             "error": "Expected raw PCM audio bytes"
         })
@@ -581,7 +602,11 @@ def handle_audio_chunk(audio_bytes):
         language = session["language"]
 
     try:
-        text, info = transcribe_pcm(audio_snapshot, language)
+        text, info = transcribe_pcm(
+            audio_snapshot,
+            language,
+            beam_size=1,
+        )
 
         emit("transcription_update", {
             "transcript_text": text,
@@ -602,6 +627,7 @@ def handle_audio_chunk(audio_bytes):
         with session["lock"]:
             session["processing"] = False
 
+
 @socketio.on("audio_stop")
 def handle_audio_stop():
     with audio_sessions_lock:
@@ -621,25 +647,18 @@ def handle_audio_stop():
             pcm_bytes = bytes(session["pcm"])
             language = session["language"]
 
-        if len(pcm_bytes) < 2:
+        # Require at least ~0.3 seconds of 16 kHz, 16-bit mono audio.
+        if len(pcm_bytes) < int(16000 * 2 * 0.3):
             emit("transcription_error", {
                 "error": "No audio received"
             })
             return
 
-        wav_bytes = pcm_to_wav(pcm_bytes)
-
-        segments, info = model.transcribe(
-            io.BytesIO(wav_bytes),
-            language=None if language == "auto" else language,
-            beam_size=5,
-            vad_filter=True,
+        final_text, info = transcribe_pcm(
+            pcm_bytes,
+            language,
+            beam_size=1,
         )
-
-        final_text = " ".join(
-            segment.text.strip()
-            for segment in segments
-        ).strip()
 
         if not final_text:
             emit("transcription_error", {
@@ -684,11 +703,11 @@ def handle_audio_stop():
             audio_sessions.pop(request.sid, None)
 
 
-
 @socketio.on("disconnect")
 def handle_disconnect():
     with audio_sessions_lock:
         audio_sessions.pop(request.sid, None)
+
 
 if __name__ == "__main__":
     socketio.run(
@@ -697,4 +716,5 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "5000")),
         debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
         use_reloader=False,
+        allow_unsafe_werkzeug=True,
     )
