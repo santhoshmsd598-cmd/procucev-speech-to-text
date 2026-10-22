@@ -72,6 +72,10 @@ model_lock = threading.Lock()
 # Set LIVE_INTERIM=false to transcribe only once, when recording stops.
 LIVE_INTERIM = os.getenv("LIVE_INTERIM", "true").lower() == "true"
 
+# Voice-activity detection (onnxruntime) adds CPU cost and a possible
+# failure point. Set WHISPER_VAD=false to skip it.
+USE_VAD = os.getenv("WHISPER_VAD", "true").lower() == "true"
+
 
 def get_db_connection():
     db_host = os.getenv("DB_HOST", "127.0.0.1")
@@ -528,17 +532,32 @@ def transcribe_pcm(pcm_bytes, language, beam_size=1):
     # The generator returned by model.transcribe() must be consumed
     # while the lock is held, otherwise the work happens outside it.
     with model_lock:
+        started = time.time()
+
         segments, info = model.transcribe(
             io.BytesIO(wav_bytes),
             language=None if language == "auto" else language,
             beam_size=beam_size,
-            vad_filter=True,
+            vad_filter=USE_VAD,
         )
 
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-        ).strip()
+        print(
+            f"[transcribe] setup done in {time.time() - started:.1f}s "
+            f"(vad={USE_VAD}, beam={beam_size})",
+            flush=True,
+        )
+
+        parts = []
+
+        for segment in segments:
+            parts.append(segment.text.strip())
+            print(
+                f"[transcribe] segment end={segment.end:.1f}s "
+                f"elapsed={time.time() - started:.1f}s",
+                flush=True,
+            )
+
+        text = " ".join(parts).strip()
 
     return text, info
 
