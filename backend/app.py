@@ -62,23 +62,10 @@ socketio = SocketIO(
 
 audio_sessions = {}
 audio_sessions_lock = threading.Lock()
-
-# Only one transcription may run on the model at a time.
-# This prevents memory spikes that crash the worker on small instances.
 model_lock = threading.Lock()
 
-# Live (interim) transcription re-processes all audio so far every ~3 s.
-# On a tiny CPU (e.g. Render free tier) this starves the final transcription.
-# Set LIVE_INTERIM=false to transcribe only once, when recording stops.
 LIVE_INTERIM = os.getenv("LIVE_INTERIM", "true").lower() == "true"
-
-# Voice-activity detection (onnxruntime) adds CPU cost and a possible
-# failure point. Set WHISPER_VAD=false to skip it.
 USE_VAD = os.getenv("WHISPER_VAD", "true").lower() == "true"
-
-# --- Transcription provider -------------------------------------------
-# "groq"  -> hosted Whisper API (fast; needs GROQ_API_KEY)
-# "local" -> Faster-Whisper inside this server (needs a strong CPU)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 TRANSCRIBE_PROVIDER = os.getenv(
     "TRANSCRIBE_PROVIDER",
@@ -87,10 +74,7 @@ TRANSCRIBE_PROVIDER = os.getenv(
 GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_PROMPT = os.getenv("GROQ_PROMPT", "").strip()
-
-# Seconds of new audio between live (interim) updates.
 INTERIM_SECONDS = float(os.getenv("INTERIM_SECONDS", "5"))
-# Live updates only send the most recent N seconds of audio.
 INTERIM_MAX_AUDIO_SECONDS = 60
 
 LANGUAGE_NAME_TO_CODE = {
@@ -104,7 +88,6 @@ _local_module_lock = threading.Lock()
 
 
 def get_local_module():
-    """Import the Faster-Whisper module only when it is really needed."""
     global _local_module
 
     with _local_module_lock:
@@ -120,13 +103,10 @@ def normalize_language(value, fallback="auto"):
         return fallback
 
     value = str(value).strip().lower()
-
-    # Keep the result short enough for the database column.
     return LANGUAGE_NAME_TO_CODE.get(value, value)[:10]
 
 
 def call_groq(file_name, audio_bytes, content_type, language):
-    """Send audio to Groq's Whisper API. Returns (text, language_code)."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
 
@@ -175,7 +155,6 @@ def call_groq(file_name, audio_bytes, content_type, language):
 
 
 def transcribe_file(path, language):
-    """Transcribe an uploaded audio file with the configured provider."""
     if TRANSCRIBE_PROVIDER == "groq":
         with open(path, "rb") as audio_file:
             audio_bytes = audio_file.read()
@@ -656,7 +635,6 @@ def pcm_to_wav(pcm_bytes, sample_rate=16000):
 
 
 def transcribe_pcm(pcm_bytes, language, beam_size=1):
-    """Return (text, detected_language, language_probability)."""
     if TRANSCRIBE_PROVIDER == "groq":
         text, detected = call_groq(
             "audio.wav",
@@ -673,9 +651,6 @@ def transcribe_pcm(pcm_bytes, language, beam_size=1):
 def transcribe_pcm_local(pcm_bytes, language, beam_size=1):
     model = get_local_module().model
     wav_bytes = pcm_to_wav(pcm_bytes)
-
-    # The generator returned by model.transcribe() must be consumed
-    # while the lock is held, otherwise the work happens outside it.
     with model_lock:
         started = time.time()
 
@@ -799,7 +774,6 @@ def handle_audio_chunk(audio_bytes):
             })
 
     except Exception:
-        # A failed live update must not stop the recording.
         app.logger.exception("Live transcription update failed")
 
     finally:
@@ -832,8 +806,6 @@ def handle_audio_stop():
             f"seconds={len(pcm_bytes) / 32000:.1f}",
             flush=True,
         )
-
-        # Require at least ~0.3 seconds of 16 kHz, 16-bit mono audio.
         if len(pcm_bytes) < int(16000 * 2 * 0.3):
             emit("transcription_error", {
                 "error": "No audio received"

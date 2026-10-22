@@ -256,7 +256,6 @@ export default function App() {
       });
 
       socket.on("disconnect", () => {
-        // Connection dropped while waiting for the final transcript.
         if (stoppingRef.current || processingRef.current) {
           clearStopTimeout();
           processingRef.current = false;
@@ -411,8 +410,6 @@ export default function App() {
     }
 
     socket.emit("audio_stop");
-
-    // Safety net: never leave the UI stuck on "Finishing audio...".
     clearStopTimeout();
     stopTimeoutRef.current = window.setTimeout(() => {
       stopTimeoutRef.current = null;

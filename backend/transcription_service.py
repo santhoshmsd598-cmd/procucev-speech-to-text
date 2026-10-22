@@ -1,11 +1,6 @@
 import os
 from faster_whisper import WhisperModel
-
-# Use the smaller model by default for Render's free instance.
 MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
-
-# On a heavily CPU-throttled instance, more threads make inference slower
-# (they spin and burn the CPU quota), so default to a single thread.
 CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "1"))
 
 USE_VAD = os.getenv("WHISPER_VAD", "true").lower() == "true"
@@ -27,15 +22,6 @@ print("Faster-Whisper model loaded successfully!")
 
 
 def transcribe_audio(audio_path, language=None):
-    """
-    Transcribe an audio file.
-
-    Supported language codes:
-    en = English
-    hi = Hindi
-    ta = Tamil
-    None = automatic language detection
-    """
     segments, info = model.transcribe(
         audio_path,
         language=language,
@@ -43,8 +29,6 @@ def transcribe_audio(audio_path, language=None):
         best_of=1,
         vad_filter=USE_VAD,
     )
-
-    # Consume the generator to finish transcription.
     transcript = " ".join(
         segment.text.strip()
         for segment in segments
